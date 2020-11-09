@@ -1,0 +1,271 @@
+---
+title: "Sourcing Analysis"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+library(tidyverse)
+library(RcppBDT)
+library(lubridate)
+library(plotly)
+library(purrr)
+theme_set(theme_light())
+```
+
+## Import Data
+```{r}
+df <- rio::import("qa-0854x.xlsx", sheet = "TV Daily Sales Data", skip=6, n_max = 418) %>% 
+  janitor::clean_names() %>% 
+  mutate(date = date %>% as.Date()) # original column was parsed as datetime, contains precision down to millisec, cause problem downstream
+```
+
+## Re-Create Chart
+```{r}
+ggplotly(df %>% 
+  ggplot(aes(date, units_sold, color = as.factor(lec_id)))+
+  geom_line()+
+  labs(title = "Sales of Collections",
+       x = "",
+       y= "",
+       color = "Collections")
+  )
+```
+
+## Holidays for boolean features
+```{r}
+holidays <- tibble(years = 2000:2050,
+                   BFriday = map(years, ~getNthDayOfWeek(fourth, Fri, Nov, .x)),
+                   boxing = lubridate::make_date(years,12,26)
+                  ) %>% 
+                    unnest(BFriday) 
+```
+
+## Transform data to collection level for next collection prediction
+```{r}
+by_collection <- df %>% 
+  group_by(lec_id) %>% 
+  group_modify(function(.x,.y){
+    start <- first(.x$date)
+    end <- last(.x$date)
+    duration <- as.integer(end-start)
+    weekends <- sum(weekdays(.x$date) %in% c("Saturday", "Sunday"))
+
+    have_black_friday <- any(.x$date %in% holidays$BFriday)
+    
+    have_boxing <- any(.x$date %in% holidays$boxing)
+    
+    data.frame(sales = sum(.x$units_sold),
+               start = start,
+               end   = end,
+               duration = duration,
+               weekends = weekends,
+               have_black_friday = have_black_friday,
+               have_boxing = have_boxing
+               # years = years
+               )
+  }) 
+```
+
+## Quick look at distribution of sales
+```{r}
+by_collection %>% 
+  ggplot(aes(sales)) +
+  geom_histogram()
+```
+
+## Model log(sales) with available features and check fit
+```{r}
+by_collection %>% 
+  select(-lec_id,-start,-end) %>% 
+  lm(log(sales) ~ duration  + weekends + have_black_friday + have_boxing , data = .) -> lm_mod # log(sales) model naturally have interactions
+
+# + have_black_friday:duration + weekends: duration
+# + I(duration^2)
+
+lm_mod %>% 
+  summary
+lm_mod %>% plot
+```
+
+## Two ways of generating simulated demands, contrasted
+
+```{r}
+N <- 100000
+
+mean_pred <- predict(lm_mod, data.frame(duration = 21, weekends = 6,have_black_friday = F, have_boxing = F))
+
+lec_sigma <- sigma(lm_mod) # could use this for lognormal distributions
+
+demands <- exp(mean_pred+sample(lm_mod$residuals,N, replace = T)) %>% round() # sample was too small, recycling the residual instead of using random distributions
+
+demands2 <- rnorm(N, mean_pred, lec_sigma) %>% exp %>% round()
+```
+```{r}
+tibble(resid = demands, distribution = demands2) %>% 
+  gather() %>% 
+  ggplot(aes(value, col = key))+
+  geom_freqpoly()+
+  labs(title = "Comparing two ways of generating demand")
+```
+
+## Calculate profit based on quantity level:350
+```{r}
+Q <- 350
+
+price <- 135
+cost <- 65
+
+sims <- tibble(demand = demands, 
+       sales = if_else(demand<=Q, demand, Q),
+       revenue = sales * price,
+       profit = revenue - Q * cost
+       )
+
+sims %>% 
+  ggplot(aes(profit))+
+  geom_histogram()+
+  labs(title =glue::glue("Profit distribution when purchase is {Q}"))
+
+summary(sims$profit)
+```
+
+## Generate profit simulation to arbitrary levels
+
+```{r}
+expected_profit <- function(Q, Ds = demands){
+  price <- 135
+  cost <- 65
+  
+  sims <- tibble(demand = Ds, 
+         sales = if_else(demand<=Q, demand, Q),
+         revenue = sales * price,
+         profit = revenue - Q * cost
+         ) 
+
+  mean(sims$profit)
+}
+```
+```{r}
+expected_profit(350) # test
+```
+
+## Optimal sourcing quantity: outsourcing only
+```{r}
+diff_Qs <- tibble(
+      Qs = c(seq(250,310, by=10), 310:350, seq(350,400, by=10)),
+      e_profit = map_dbl(Qs, expected_profit))
+
+ggplotly(       
+       diff_Qs %>% 
+  ggplot(aes(Qs, e_profit))+
+  geom_line()+
+  geom_vline(xintercept = 314, lty=2)+
+  scale_y_continuous(labels = scales::dollar)+
+  geom_text(data = data.frame(x = 355, y = 17300, label = "Source 315 from Ukraine proves to be most profitable"),mapping = aes(x = x, y = y, label = label), size = 3.86605783866058, alpha = 1, inherit.aes = FALSE)+
+
+  labs(title = "Expected profit under different sourcing quantity",
+       x="",
+       y=""
+       )
+  )
+```
+```{r}
+diff_Qs %>% 
+  filter(e_profit == max(e_profit))
+
+max_profit_outsourcing <- diff_Qs %>% 
+  filter(e_profit == max(e_profit)) %>% 
+  pull(e_profit)
+
+```
+
+
+Source 315 from Ukraine proves to be most profitable
+
+# Local Sourcing
+
+```{r}
+Q <- 350
+
+price <- 135
+cost_out <- 65
+cost_in <- 95
+
+sims <- tibble(demand = demands, 
+       local_needed = demand>Q,  
+       sales_out = if_else(!local_needed, demand, Q),
+       sales_in = if_else(local_needed,
+                          if_else(demand<=Q+21*12,demand-Q, 21*12),
+                          0),
+       revenue = (sales_in + sales_out) * price,
+       profit = revenue - Q * cost - sales_in *cost_in
+       )
+
+sims %>% 
+  ggplot(aes(profit))+
+  geom_histogram()+
+  labs(title =glue::glue("Profit distribution when purchase is {Q}"))
+
+summary(sims$profit)
+```
+
+
+```{r}
+expected_profit_local <- function(Q, Ds = demands){
+  price <- 135
+  cost_in <- 95
+  
+  sims <- tibble(demand = demands, 
+         local_needed = demand>Q,  
+         sales_out = if_else(!local_needed, demand, Q),
+         sales_in = if_else(local_needed,
+                            if_else(demand<=Q+21*12,demand-Q, 21*12),
+                            0),
+         revenue = (sales_in + sales_out) * price,
+         profit = revenue - Q * cost - sales_in *cost_in
+         )
+
+  mean(sims$profit)
+}
+```
+
+```{r}
+expected_profit_local(250)
+```
+
+```{r}
+diff_Qs <- tibble(
+      Qs = c(249,seq(250,350)),
+      e_profit = map_dbl(Qs, expected_profit_local)       
+       )
+ggplotly(diff_Qs %>% 
+  ggplot(aes(Qs, e_profit))+
+  geom_line()+
+  geom_vline(xintercept = 270, lty=2)+
+  scale_y_continuous(labels = scales::dollar)+
+  geom_text(data = data.frame(x = 298, y = 19700, label = "Source 270 from Ukraine proves to be most profitable"),mapping = aes(x = x, y = y, label = label), size = 3.86605783866058, alpha = 1, inherit.aes = FALSE)+
+
+  labs(title = "Expected profit under different sourcing quantity",
+       x="",
+       y=""
+       )
+  )
+```
+
+```{r}
+diff_Qs %>% 
+  filter(e_profit == max(e_profit))
+
+max_profit_local <- diff_Qs %>% 
+  filter(e_profit == max(e_profit)) %>% 
+  pull(e_profit)
+
+```
+
+```{r}
+max_profit_local - max_profit_outsourcing
+```
+

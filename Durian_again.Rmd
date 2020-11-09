@@ -1,0 +1,134 @@
+---
+title: "Durian Again"
+output: 
+  html_document:
+    toc: true
+params:
+  junior: 6
+  mid: 5
+  senior: 2
+  prelim_yield: 0.5
+  arrival_rate: 90
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+library(simmer)
+library(simmer.plot)
+library(magrittr)
+```
+
+# Define simulation time
+
+```{r}
+SystemTime <- 52*16 # 6 years for warm up and 10 years for simulation
+```
+
+# Run simulation 100 times
+
+```{r}
+results <-lapply(1:100, function(i) {
+  env <- simmer("durian")
+
+  deal <- trajectory("deal's path") %>%
+
+    ## add an prelim activity
+    seize("junior", 1) %>%
+    timeout(function() rexp(1, 48.75/150)) %>%
+    release("junior", 1) %>%
+    leave(function() runif(1) < params$prelim_yield, keep_seized = F) %>%
+
+    ## add a DD activity
+    seize("mid", 1) %>%
+    timeout(function() rexp(1, 1/4)) %>%
+    release("mid", 1) %>%
+    leave(function() runif(1) < 2/3, keep_seized = F) %>%
+
+    ## add a Negotiation + Closing activity
+    seize("senior", 1) %>%
+    # log_("New deal fall to the seniors") %>% # add a log
+    set_attribute("Negotiation_pass", function() runif(1)<0.2) %>%
+    # log_(function() {paste("Negotiation_pass:", get_attribute(env,"Negotiation_pass"))}) %>%
+    timeout(function() if(get_attribute(env,"Negotiation_pass")) rexp(1, 1/4) + rexp(1, 1/5) else rexp(1, 1/4)) %>%
+    release("senior", 1)
+
+  env %>%
+    add_resource("junior", params$junior) %>%
+    add_resource("mid", params$mid) %>%
+    add_resource("senior", params$senior) %>%
+    add_generator("Deal", deal, function() rexp(1, params$arrival_rate/52), mon = 2) %>%
+    run(until = SystemTime)
+})
+```
+
+# Tidy the simulation results
+```{r}
+results_nego <- results %>% get_mon_attributes()
+results_arr <- results %>% get_mon_arrivals()
+results_features <- results_arr %>%
+  dplyr::left_join(
+    results_nego %>%
+      dplyr::select(name, replication, value)
+  )
+resources <- get_mon_resources(results)
+results_post <- results_features %>%
+  dplyr::filter(start_time>52*6) %>% # leave only the last 5 years
+  dplyr::filter(value==1) %>%  # Keep only those passed negotiation
+  dplyr::filter(finished) # to filter out those pass negotiation but has yet to finish completion
+```
+
+# Sanity Checks
+## Utilization rate
+```{r}
+plot(resources, metric = "utilization",  c("junior", "mid", "senior"))
+# result is very close to excel
+```
+
+## Throughput
+```{r}
+results_features %>%
+  dplyr::filter(start_time>52*6) %>% # leave only the last 10 years
+  dplyr::filter(value==1) %>%
+  dplyr::summarise(sum(value)) %>%
+  {./100/10} # sanity check should be around 3
+```
+
+# Results Analysis
+
+A chart for all the completion times
+```{r}
+hist(results_post$activity_time)
+```
+## Average Completion time
+
+```{r}
+mean(results_post$activity_time)
+```
+
+## % completion longer than 26 weeks
+
+```{r}
+mean(results_post$activity_time>26)
+```
+
+
+## Calculate profit
+```{r}
+staff_cost <- 52*(params$junior*2500+params$mid*5000+params$senior*15000)/1e6
+
+results_post <- results_post %>%
+  dplyr::mutate(revenue = 4 * 0.99^activity_time ) 
+```
+
+```{r}
+results_post %>%
+  ggplot(aes(revenue))+
+  geom_histogram()+
+  labs(title = "Revenue Distribution")
+```
+
+### Expected Profit
+```{r}
+sum(results_post$revenue)/100/10 - staff_cost
+```
+
