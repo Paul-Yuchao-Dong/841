@@ -12,11 +12,31 @@ library(RcppBDT)
 library(lubridate)
 library(plotly)
 library(purrr)
+library(rstan)
+library(brms)
 theme_set(theme_light())
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores()-1)
+
+set.seed(1984)
+
+normalize <- function(x){
+  (x-mean(x))/sd(x)
+}
+
+fit_normalize <- function(x, ref) {
+  (x - mean(ref)) / sd(ref)
+}
+
+reverse_normalize <- function(x,ref){
+  x * sd(ref) + mean(ref)
+}
 ```
 
 ## Import Data
 ```{r}
+
 df <- rio::import("qa-0854x.xlsx", sheet = "TV Daily Sales Data", skip=6, n_max = 418) %>% 
   janitor::clean_names() %>% 
   mutate(date = date %>% as.Date()) # original column was parsed as datetime, contains precision down to millisec, cause problem downstream
@@ -87,12 +107,16 @@ by_collection %>%
 
 lm_mod %>% 
   summary
-lm_mod %>% plot
+
+par(mfrow = c(2, 2))
+lm_mod %>% plot(ask=F)
+par(mfrow = c(1, 1))
 ```
 
-## Two ways of generating simulated demands, contrasted
+## Three ways of generating simulated demands, contrasted
 
 ```{r}
+
 N <- 100000
 
 mean_pred <- predict(lm_mod, data.frame(duration = 21, weekends = 6,have_black_friday = F, have_boxing = F))
@@ -103,12 +127,37 @@ demands <- exp(mean_pred+sample(lm_mod$residuals,N, replace = T)) %>% round() # 
 
 demands2 <- rnorm(N, mean_pred, lec_sigma) %>% exp %>% round()
 ```
+
 ```{r}
-tibble(resid = demands, distribution = demands2) %>% 
+df <- by_collection %>% 
+  ungroup() %>% 
+  select(-lec_id,-start,-end) %>% 
+  mutate(log_sales = log(sales)) %>% 
+  select(-sales)
+
+df_scaled <- df %>% 
+  mutate(across(c(duration,log_sales, weekends), normalize))
+
+iter <- floor(N / 4) * 2 # 4 chains and half goes to warmup
+
+lec_brm <- brm(log_sales ~ duration  + weekends + have_black_friday + have_boxing , data = df_scaled, iter = iter)
+
+newdata <- data.frame(duration = fit_normalize(21, df$duration), 
+                      weekends = fit_normalize(6, df$weekends),
+                      have_black_friday = F, have_boxing = F)
+
+pred <- predict(lec_brm, newdata = newdata, summary = F) %>% 
+  reverse_normalize(df$log_sales) %>% 
+  exp %>% 
+  round
+```
+
+```{r}
+tibble(resid = demands, distribution = demands2, bayes = pred) %>% 
   gather() %>% 
   ggplot(aes(value, col = key))+
   geom_freqpoly()+
-  labs(title = "Comparing two ways of generating demand")
+  labs(title = "Comparing three ways of generating demand")
 ```
 
 ## Calculate profit based on quantity level:350
@@ -118,7 +167,7 @@ Q <- 350
 price <- 135
 cost <- 65
 
-sims <- tibble(demand = demands, 
+sims <- tibble(demand = pred, 
        sales = if_else(demand<=Q, demand, Q),
        revenue = sales * price,
        profit = revenue - Q * cost
@@ -135,7 +184,7 @@ summary(sims$profit)
 ## Generate profit simulation to arbitrary levels
 
 ```{r}
-expected_profit <- function(Q, Ds = demands){
+expected_profit <- function(Q, Ds = pred){
   price <- 135
   cost <- 65
   
@@ -145,7 +194,7 @@ expected_profit <- function(Q, Ds = demands){
          profit = revenue - Q * cost
          ) 
 
-  mean(sims$profit)
+  data.frame(profit_expected = mean(sims$profit), profit_sd = sd(sims$profit))
 }
 ```
 ```{r}
@@ -156,15 +205,24 @@ expected_profit(350) # test
 ```{r}
 diff_Qs <- tibble(
       Qs = c(seq(250,310, by=10), 310:350, seq(350,400, by=10)),
-      e_profit = map_dbl(Qs, expected_profit))
+      e_profit = map(Qs, expected_profit)) %>% 
+    unnest(e_profit)
+
+optimal_Q <- diff_Qs %>% 
+  filter(profit_expected == max(profit_expected)) %>% 
+  pull(Qs)
+
+max_profit_outsourcing <- diff_Qs %>% 
+  filter(profit_expected == max(profit_expected)) %>% 
+  pull(profit_expected)
 
 ggplotly(       
        diff_Qs %>% 
-  ggplot(aes(Qs, e_profit))+
+  ggplot(aes(Qs, profit_expected))+
   geom_line()+
-  geom_vline(xintercept = 314, lty=2)+
+  geom_vline(xintercept = optimal_Q, lty=2)+
   scale_y_continuous(labels = scales::dollar)+
-  geom_text(data = data.frame(x = 355, y = 17300, label = "Source 315 from Ukraine proves to be most profitable"),mapping = aes(x = x, y = y, label = label), size = 3.86605783866058, alpha = 1, inherit.aes = FALSE)+
+  geom_text(data = data.frame(x = optimal_Q, y = max_profit_outsourcing, label = glue::glue("Source {optimal_Q} from Ukraine proves to be most profitable")),mapping = aes(x = x, y = y, label = label), size = 3.9, alpha = 1, inherit.aes = FALSE, check_overlap = T, nudge_x = 40)+
 
   labs(title = "Expected profit under different sourcing quantity",
        x="",
@@ -173,12 +231,13 @@ ggplotly(
   )
 ```
 ```{r}
-diff_Qs %>% 
-  filter(e_profit == max(e_profit))
+optimal_Q <- diff_Qs %>% 
+  filter(profit_expected == max(profit_expected)) %>% 
+  pull(Qs)
 
 max_profit_outsourcing <- diff_Qs %>% 
-  filter(e_profit == max(e_profit)) %>% 
-  pull(e_profit)
+  filter(profit_expected == max(profit_expected)) %>% 
+  pull(profit_expected)
 
 ```
 
@@ -214,7 +273,7 @@ summary(sims$profit)
 
 
 ```{r}
-expected_profit_local <- function(Q, Ds = demands){
+expected_profit_local <- function(Q, Ds = pred){
   price <- 135
   cost_in <- 95
   
@@ -238,7 +297,7 @@ expected_profit_local(250)
 
 ```{r}
 diff_Qs <- tibble(
-      Qs = c(249,seq(250,350)),
+      Qs = c(249,seq(250,350)), # turn Qs to double
       e_profit = map_dbl(Qs, expected_profit_local)       
        )
 ggplotly(diff_Qs %>% 
