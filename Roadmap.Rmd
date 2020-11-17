@@ -1,0 +1,492 @@
+---
+title: "Sourcing Analysis"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+library(tidyverse)
+library(lubridate)
+library(plotly)
+library(purrr)
+
+library(furrr)
+future::plan(multiprocess)
+
+theme_set(theme_light())
+
+set.seed(1984)
+
+normalize <- function(x){
+  (x-mean(x))/sd(x)
+}
+
+fit_normalize <- function(x, ref) {
+  (x - mean(ref)) / sd(ref)
+}
+
+reverse_normalize <- function(x,ref){
+  x * sd(ref) + mean(ref)
+}
+```
+
+## Import Data
+```{r}
+
+df <- rio::import("qa-0854x.xlsx", sheet = "TV Daily Sales Data", skip=6, n_max = 418) %>% 
+  janitor::clean_names() %>% 
+  mutate(date = date %>% as.Date()) # original column was parsed as datetime, contains precision down to millisec, cause problem downstream
+```
+
+## Re-Create Chart
+```{r}
+ggplotly(df %>% 
+  ggplot(aes(date, units_sold, color = as.factor(lec_id)))+
+  geom_line()+
+  labs(title = "Sales of Collections",
+       x = "",
+       y= "",
+       color = "Collections")
+  )
+```
+
+## Transform data to collection level for next collection prediction
+```{r}
+by_collection <- df %>% 
+  group_by(lec_id) %>% 
+  group_modify(function(.x,.y){
+    start <- first(.x$date)
+    end <- last(.x$date)
+    duration <- as.integer(end-start)
+    weekends <- sum(weekdays(.x$date) %in% c("Saturday", "Sunday"))
+
+    
+    
+    data.frame(sales = sum(.x$units_sold),
+               start = start,
+               end   = end,
+               duration = duration,
+               weekends = weekends
+               )
+  }) %>% 
+  ungroup() %>% 
+  mutate(holiday = if_else(lec_id %in% c(8,17:19), TRUE, FALSE))
+
+by_collection
+```
+
+## Quick look at distribution of sales
+```{r}
+by_collection %>% 
+  ggplot(aes(sales)) +
+  geom_histogram()
+```
+
+## Model log(sales) with available features and check fit
+```{r}
+by_collection %>% 
+  select(-lec_id,-start,-end) %>% 
+  lm(log(sales) ~ duration + holiday , data = .) -> lm_mod # log(sales) model naturally have interactions
+
+lm_mod %>% 
+  summary
+
+par(mfrow = c(2, 2))
+lm_mod %>% plot(ask=F)
+par(mfrow = c(1, 1))
+```
+
+## Two ways of generating simulated demands, contrasted
+
+```{r}
+
+N <- 100000
+
+mean_pred <- predict(lm_mod, data.frame(duration = 21, holiday = F))
+
+lec_sigma <- sigma(lm_mod) # could use this for lognormal distributions
+
+demands <- exp(mean_pred+sample(lm_mod$residuals,N, replace = T)) %>% round() # sample was too small, recycling the residual instead of using random distributions
+
+demands2 <- rnorm(N, mean_pred, lec_sigma) %>% exp %>% round()
+```
+
+```{r}
+tibble(resid = demands, distribution = demands2) %>% 
+  gather() %>% 
+  ggplot(aes(value, col = key))+
+  geom_freqpoly()+
+  labs(title = "Comparing three ways of generating demand")
+```
+
+## Calculate profit based on quantity level:350
+```{r}
+Q <- 350
+
+price <- 135
+cost <- 65
+
+sims <- tibble(demand = demands2, 
+       sales = if_else(demand<=Q, demand, Q),
+       revenue = sales * price,
+       profit = revenue - Q * cost
+       )
+
+sims %>% 
+  ggplot(aes(profit))+
+  geom_histogram()+
+  labs(title =glue::glue("Profit distribution when purchase is {Q}"))
+
+summary(sims$profit)
+```
+
+## Generate profit simulation to arbitrary levels
+
+```{r}
+expected_profit <- function(Q, Ds = demands2){
+  price <- 135
+  cost <- 65
+  
+  sims <- tibble(demand = Ds, 
+         sales = if_else(demand<=Q, demand, Q),
+         revenue = sales * price,
+         profit = revenue - Q * cost
+         ) 
+
+  data.frame(profit_expected = mean(sims$profit), profit_sd = sd(sims$profit))
+}
+```
+```{r}
+expected_profit(350) # test
+```
+
+## Optimal sourcing quantity: outsourcing only
+```{r}
+diff_Qs <- tibble(
+      Qs = c(200,201:350),
+      e_profit = map(Qs, expected_profit)) %>% 
+    unnest(e_profit)
+
+optimal_Q <- diff_Qs %>% 
+  filter(profit_expected == max(profit_expected)) %>% 
+  pull(Qs)
+
+max_profit_outsourcing <- diff_Qs %>% 
+  filter(profit_expected == max(profit_expected)) %>% 
+  pull(profit_expected)
+
+ggplotly(       
+       diff_Qs %>% 
+  ggplot(aes(Qs, profit_expected))+
+  geom_line()+
+  geom_vline(xintercept = optimal_Q, lty=2)+
+  scale_y_continuous(labels = scales::dollar)+
+  geom_text(data = data.frame(x = optimal_Q, y = max_profit_outsourcing, label = glue::glue("Source {optimal_Q} from Ukraine proves to be most profitable")),mapping = aes(x = x, y = y, label = label), size = 3.9, alpha = 1, inherit.aes = FALSE, check_overlap = T, nudge_x = 40)+
+
+  labs(title = "Expected profit under different sourcing quantity",
+       x="",
+       y=""
+       )
+  )
+```
+```{r}
+optimal_Q <- diff_Qs %>% 
+  filter(profit_expected == max(profit_expected)) %>% 
+  pull(Qs)
+
+max_profit_outsourcing <- diff_Qs %>% 
+  filter(profit_expected == max(profit_expected)) %>% 
+  pull(profit_expected)
+
+```
+
+
+Source `r optimal_Q` from Ukraine proves to be most profitable, with profit `r `max_profit_outsourcing`
+
+# Local Sourcing
+
+```{r}
+Q <- 253
+
+price <- 135
+cost_out <- 65
+cost_in <- 95
+
+sims <- tibble(demand = demands2, 
+       local_needed = demand>Q,  
+       sales_out = if_else(!local_needed, demand, Q),
+       sales_in = if_else(local_needed,
+                          if_else(demand<=Q+(21-7)*12,demand-Q, (21-7)*12),
+                          0),
+       revenue = (sales_in + sales_out) * price,
+       profit = revenue - Q * cost - sales_in *cost_in
+       )
+
+sims %>% 
+  ggplot(aes(profit))+
+  geom_histogram()+
+  labs(title =glue::glue("Profit distribution when purchase is {Q}"))
+
+summary(sims$profit)
+```
+
+
+```{r}
+expected_profit_local <- function(Q, Ds = demands2, duration = 21){
+  price <- 135
+  cost_in <- 95
+  cost_out <- 65
+  
+  sims <- tibble(demand = Ds, 
+         local_needed = demand>Q,  
+         sales_out = if_else(!local_needed, demand, Q),
+         sales_in = if_else(local_needed,
+                            if_else(demand<=Q+(duration-7)*12,demand-Q, (duration-7)*12),
+                            0),
+         revenue = (sales_in + sales_out) * price,
+         profit = revenue - Q * cost_out - sales_in *cost_in
+         )
+
+  mean(sims$profit)
+}
+```
+
+```{r}
+expected_profit_local(253) #test
+```
+
+```{r}
+diff_Qs <- tibble(
+      Qs = c(200,seq(201,260)), # turn Qs to double
+      e_profit = map_dbl(Qs, expected_profit_local)       
+       )
+
+near_optimal_Q <- diff_Qs %>% 
+  filter(e_profit == max(e_profit)) %>% 
+  pull(Qs)
+
+max_profit_local <- diff_Qs %>% 
+  filter(e_profit == max(e_profit)) %>% 
+  pull(e_profit)
+
+
+
+ggplotly(diff_Qs %>% 
+  ggplot(aes(Qs, e_profit))+
+  geom_line()+
+  geom_vline(xintercept = near_optimal_Q, lty=2)+
+  scale_y_continuous(labels = scales::dollar)+
+  geom_text(data = data.frame(x = near_optimal_Q, y = max_profit_local, label = glue::glue("Source {near_optimal_Q} from Ukraine proves to be most profitable")),mapping = aes(x = x, y = y, label = label), size = 3.9, alpha = 1, inherit.aes = FALSE, nudge_x = 20)+
+
+  labs(title = "Expected profit under different sourcing quantity",
+       x="",
+       y=""
+       )
+  )
+```
+
+
+```{r}
+max_profit_local - max_profit_outsourcing
+```
+
+# Backtesting
+
+## Availability of data
+
+For LEC 11, only LEC data from 1-10 is available.
+
+```{r}
+LEC <- 23
+
+# Model demand
+by_collection %>%
+  filter(lec_id<LEC) %>% # only data prior to this LEC is available
+  select(-lec_id,-start,-end) %>% # This is not strictly necessary, just here to not include id as a variable
+  lm(log(sales) ~ duration + holiday , data = .) -> lm_mod
+
+actual_demand <- by_collection %>% filter(lec_id == LEC) %>% pull(sales)
+
+# Simulate demands
+N <- 100000
+
+mean_pred <- predict(lm_mod, by_collection %>% filter(lec_id==LEC))
+# mean_pred <- predict(lm_mod, data.frame(duration = 21, holiday = F)) # only for testing
+
+lec_sigma <- sigma(lm_mod) # could use this for lognormal distributions
+
+demands <- rnorm(N, mean_pred, lec_sigma) %>% exp %>% round()
+
+# Outsource only quantity
+range_Qs <- c(2:1500)
+
+profits <- tibble(
+      Qs = c(1, range_Qs),
+      e_profit = future_map(Qs, ~expected_profit(Q = .x, Ds = demands))) %>% 
+    unnest(e_profit)
+
+
+optimal <- profits %>% filter(profit_expected == max(profit_expected ))
+
+out_optimal_Q <- optimal %>% pull(Qs)
+out_optimal_profit <- optimal %>% pull(profit_expected)
+
+out_actual_profit <- {
+  sales <- if(actual_demand > out_optimal_Q) out_optimal_Q else actual_demand
+  sales * 135 - out_optimal_Q * 65
+}
+
+# With near-sourcing options
+
+duration <- by_collection %>% filter(lec_id==LEC) %>% pull(duration)
+
+# duration <- 21 # only for testing
+
+profits_in <- tibble(
+  Qs = c(1, range_Qs),
+  e_profit = future_map_dbl(Qs, ~expected_profit_local(Q = .x, Ds = demands, duration = duration))
+)
+
+optimal <- profits_in %>% filter(e_profit == max(e_profit ))
+
+in_optimal_Q <- optimal %>% pull(Qs)
+in_optimal_profit <- optimal %>% pull(e_profit)
+
+in_actual_profit <- {
+  local_needed <- actual_demand > in_optimal_Q
+  sales_out <- if(!local_needed) actual_demand else in_optimal_Q
+  sales_in <- if_else(local_needed,
+                      if_else(actual_demand<=in_optimal_Q+(duration-7)*12,
+                              actual_demand-in_optimal_Q, 
+                              (duration-7)*12),
+                            0)
+  revenue <-  (sales_in + sales_out) * 135
+  profit = revenue - in_optimal_Q * 65 - sales_in * 95
+  profit
+}
+
+
+output <- by_collection %>% 
+  filter(lec_id == LEC) %>% 
+  mutate(ln_mean_demand = mean_pred,
+         ln_mean_sigma = lec_sigma,
+         sim_demand_mean = mean(demands)
+         ) %>% 
+  mutate(out_optimal_Q = out_optimal_Q,
+         out_optimal_profit = out_optimal_profit,
+         out_actual_profit = out_actual_profit,
+         in_optimal_Q = in_optimal_Q,
+         in_optimal_profit = in_optimal_profit,
+         in_actual_profit = in_actual_profit
+         )
+
+```
+
+
+
+```{r}
+
+backtest <- function(LEC = 23){
+
+# Model demand
+by_collection %>%
+  filter(lec_id<LEC) %>% # only data prior to this LEC is available
+  select(-lec_id,-start,-end) %>% # This is not strictly necessary, just here to not include id as a variable
+  lm(log(sales) ~ duration + holiday , data = .) -> lm_mod
+
+actual_demand <- by_collection %>% filter(lec_id == LEC) %>% pull(sales)
+
+# Simulate demands
+N <- 100000
+
+mean_pred <- predict(lm_mod, by_collection %>% filter(lec_id==LEC))
+# mean_pred <- predict(lm_mod, data.frame(duration = 21, holiday = F)) # only for testing
+
+lec_sigma <- sigma(lm_mod) # could use this for lognormal distributions
+
+demands <- rnorm(N, mean_pred, lec_sigma) %>% exp %>% round()
+
+# Outsource only quantity
+range_Qs <- c(2:1500)
+
+profits <- tibble(
+      Qs = c(1, range_Qs),
+      e_profit = future_map(Qs, ~expected_profit(Q = .x, Ds = demands))) %>% 
+    unnest(e_profit)
+
+
+optimal <- profits %>% filter(profit_expected == max(profit_expected ))
+
+out_optimal_Q <- optimal %>% pull(Qs)
+out_optimal_profit <- optimal %>% pull(profit_expected)
+
+out_actual_profit <- {
+  sales <- if(actual_demand > out_optimal_Q) out_optimal_Q else actual_demand
+  sales * 135 - out_optimal_Q * 65
+}
+
+# With near-sourcing options
+
+duration <- by_collection %>% filter(lec_id==LEC) %>% pull(duration)
+
+# duration <- 21 # only for testing
+
+profits_in <- tibble(
+  Qs = c(1, range_Qs),
+  e_profit = future_map_dbl(Qs, ~expected_profit_local(Q = .x, Ds = demands, duration = duration))
+)
+
+optimal <- profits_in %>% filter(e_profit == max(e_profit ))
+
+in_optimal_Q <- optimal %>% pull(Qs)
+in_optimal_profit <- optimal %>% pull(e_profit)
+
+in_actual_profit <- {
+  local_needed <- actual_demand > in_optimal_Q
+  sales_out <- if(!local_needed) actual_demand else in_optimal_Q
+  sales_in <- if_else(local_needed,
+                      if_else(actual_demand<=in_optimal_Q+(duration-7)*12,
+                              actual_demand-in_optimal_Q, 
+                              (duration-7)*12),
+                            0)
+  revenue <-  (sales_in + sales_out) * 135
+  profit = revenue - in_optimal_Q * 65 - sales_in * 95
+  profit
+}
+
+
+output <- by_collection %>% 
+  filter(lec_id == LEC) %>% 
+  mutate(ln_mean_demand = mean_pred,
+         ln_mean_sigma = lec_sigma,
+         sim_demand_mean = mean(demands)
+         ) %>% 
+  mutate(out_optimal_Q = out_optimal_Q,
+         out_optimal_profit = out_optimal_profit,
+         out_actual_profit = out_actual_profit,
+         in_optimal_Q = in_optimal_Q,
+         in_optimal_profit = in_optimal_profit,
+         in_actual_profit = in_actual_profit
+         )
+  output
+}
+
+```
+
+```{r}
+backtests <- tibble(LEC = c(11,12:23))
+```
+
+```{r}
+
+backtest_result <-  future_map_dfr(11:23, backtest)
+```
+
+```{r}
+backtest_result %>% 
+  rio::export("backtest_results.xlsx")
+```
+
+

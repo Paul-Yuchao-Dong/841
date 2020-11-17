@@ -1,0 +1,112 @@
+---
+title: "TCS"
+output: word_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+library(tidyverse)
+library(modelr)
+theme_set(theme_light())
+```
+```{r}
+timesheet <- rio::import("Assignment 2 Exhibits.xlsx", sheet = "Time", skip=5) %>% 
+  as_tibble() %>% 
+  janitor::clean_names()
+timesheet <- timesheet %>% 
+  mutate(rpc_rate = right_party_connect_count / call_count)
+```
+```{r}
+metrics <- rio::import("Q2 TCS_Metrics_FInal.xlsx", sheet = "TCS_Metrics") %>% 
+    as_tibble() %>% 
+    janitor::clean_names()
+metrics <- metrics[,1:7]
+```
+
+```{r}
+df <- metrics %>% 
+  left_join(timesheet %>% 
+              select(dialer_id,work_time_in_hours, rpc_rate))
+df <- df %>% filter(total_payment_amount != 0 )
+```
+
+```{r}
+lm_mod <- lm(log(total_payment_amount) ~ log(work_time_in_hours) + rpc_rate, data = df)
+summary(lm_mod)
+par(mfrow=c(2,2))
+plot(lm_mod, ask = F)
+par(mfrow=c(1,1))
+```
+
+```{r}
+df <- df %>% 
+  modelr::add_predictions(lm_mod) %>% 
+  mutate(pred = pred %>% exp) %>% 
+  mutate(residual = total_payment_amount - pred)
+
+df %>% 
+  ggplot(aes(residual))+
+  geom_histogram()
+```
+
+```{r}
+df <- df %>% 
+  mutate(rpc_adj_total = total_payment_amount / exp(rpc_rate * 5.24963)) %>% 
+  mutate(hourly_gain = rpc_adj_total / work_time_in_hours) 
+
+df %>% 
+  summarise(mean(hourly_gain>60.3))
+```
+
+
+```{r}
+df %>% 
+  ggplot(aes(total_payment_amount, hourly_gain, color = hourly_gain>48))+
+  geom_point()+
+  scale_x_log10()+
+  scale_y_log10()+
+  labs(
+    title = "42.6% of the reps meets the standard",
+    x = "total payment in log scale",
+    y = "hourly gain in log scale"
+  )
+```
+
+On average the performance is actually good.
+
+```{r}
+df %>% 
+  summarise(mean(hourly_gain))
+```
+
+```{r}
+df %>% 
+  ggplot(aes(hourly_gain, fill = hourly_gain>60.3))+
+  geom_histogram() +
+  labs(title = "Distribution of hourly gains")
+```
+
+```{r}
+t.test(df$hourly_gain, mu = 60.3)
+```
+
+
+```{r}
+new_ppl <- df %>% 
+  mutate(new_total = if_else(hourly_gain<60.3, 60.3*work_time_in_hours * exp(rpc_rate * 5.24963), total_payment_amount))
+```
+```{r}
+new_rev <- new_ppl %>% 
+  summarise(total = sum(new_total)) %>% 
+  pull(total)
+
+old_rev <- df %>% 
+  summarise(total = sum(total_payment_amount)) %>% 
+  pull(total)
+
+new_rev / old_rev
+new_rev - old_rev
+```
+
