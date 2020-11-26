@@ -276,6 +276,7 @@ summary(sims$profit)
 expected_profit_local <- function(Q, Ds = pred){
   price <- 135
   cost_in <- 95
+  cost <- 65
   
   sims <- tibble(demand = demands, 
          local_needed = demand>Q,  
